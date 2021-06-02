@@ -3,9 +3,11 @@ A PettingZoo Gym-based environment for microelectrode-dot-array (MEDA) biochips.
 
 ## Overview
 This environment simulates the dynamic environment of a MEDA biochip. A fabricated MEDA biochip is shown below, where two droplets need to be transported to the destinations. However, it is possible that the two droplets might collide, resulting in unwanted reagent contamination.
+
 <img src="./collide_exp.png" align="middle" width="70%"/>
 
 This issue can be solved by a trained MARL agent. We recorded how an agent transports the two droplets to their destinations.
+
 <img src="./30x60n2_3g.gif" align="middle" width="70%"/>
 
 For furhter information, please reference our ICML'21 paper named "Parallel Droplet Control in MEDA Biochips using Ｍulti-Agent Reinforcement Learning".
