@@ -5,89 +5,114 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import warnings
 warnings.filterwarnings('ignore')
 from pathlib import Path
-
+import argparse
 import time
 
 import matplotlib
 import matplotlib.pyplot as plt
 import tensorflow as tf
 
-
-from my_net import SimpleCnnPolicy, SimpleCnnLstmPolicy, SimpleCnnLnLstmPolicy,\
-        VggCnnPolicy, VggCnnLstmPolicy, VggCnnLnLstmPolicy
-
-from meda import*
-
 from stable_baselines.common import make_vec_env
 from stable_baselines.common.vec_env import DummyVecEnv
-from stable_baselines.common.policies import MlpPolicy, MlpLstmPolicy, MlpLnLstmPolicy
 from stable_baselines.common.evaluation import evaluate_policy
-from stable_baselines import PPO2, A2C
+from stable_baselines import PPO2, ACER, DQN
+
+from meda import*
+from my_net import VggCnnPolicy, DqnVggCnnPolicy
 import csv
 
-policy_names_to_policies = {'VggCnnPolicy': VggCnnPolicy,
-        'VggCnnLnLstmPolicy': VggCnnLnLstmPolicy}
+ALGOS = {'PPO': PPO2, 'ACER': ACER, 'DQN': DQN}
 
-algorithm_names_to_algorithms = {'PPO': PPO2,
-        'A2C': A2C}
+def get_ave_max_min (agent_rewards):
+    print(agent_rewards.shape)
+    agent_line = np.average(agent_rewards, axis = 0)
+    agent_max = np.max(agent_rewards, axis = 0)
+    agent_min = np.min(agent_rewards, axis = 0)
+    return agent_line, agent_max, agent_min
 
+def plotRewards(args, multi_agent_rewards, baseline_rewards, path_log):
+    plt.style.use('ggplot')
+    plt.rcParams.update({'font.size': 20})
+    fig, ax = plt.subplots()
+    # PPO
+    r_ave, r_max, r_min = get_ave_max_min(multi_agent_rewards['PPO'])
+    x_episodes = list(range(0, 0 + 5*len(r_ave), 5))
+    ax.fill_between(x_episodes, r_max, r_min, alpha = 0.3)
+    ax.plot(x_episodes, r_ave, marker='v', markersize=8, label = 'PPO')
+    # ACER
+    r_ave, r_max, r_min = get_ave_max_min(multi_agent_rewards['ACER'])
+    ax.fill_between(x_episodes, r_max, r_min, alpha = 0.3)
+    ax.plot(x_episodes, r_ave, marker='o', markersize=8, label = 'ACER')
+    # DQN
+    r_ave, r_max, r_min = get_ave_max_min(multi_agent_rewards['DQN'])
+    ax.fill_between(x_episodes, r_max, r_min, alpha = 0.3)
+    ax.plot(x_episodes, r_ave, marker='^', markersize=8, label = 'DQN')
+    # Baseline
+    baesline = np.concatenate(list(baseline_rewards.values()), axis=0)
+    r_ave, r_max, r_min = get_ave_max_min(baesline)
+    ax.fill_between(x_episodes, r_max, r_min, alpha = 0.3)
+    ax.plot(x_episodes, r_ave, marker='x', markersize=8, label = 'Baseline')
+    ax.set_xlabel('Number of Epochs', fontsize=20)
+    ax.set_ylabel('Score', fontsize=20)
+    leg = ax.legend(loc='lower right', shadow = True, fancybox = True, fontsize = 18)
+    leg.get_frame().set_alpha(0.5)
+    plt.tight_layout()
+    path_fig = os.path.join(path_log, 'icml_'+args.method+'.png')
+    plt.savefig(path_fig)
 
-def plotAgentPerformance(a_rewards, policy_name, algorithm_name, path_log, b_path = False):
+def read_rewards(path_log, filename):
+    path_reward = os.path.join(path_log, filename)
+
+    if not os.path.exists(path_reward):
+        raise Exception('Path %s does not exist' %path_reward)
+
+    with open(path_reward, "r") as a:
+        wr_a = csv.reader(a, delimiter=',')
+        a_rewards = list(wr_a)
     a_rewards = np.array(a_rewards).astype(np.float)
-    print("Shape of A_rewards: ", a_rewards.shape)
-    a_line = np.average(a_rewards, axis = 0)
-    a_max = np.max(a_rewards, axis = 0)
-    a_min = np.min(a_rewards, axis = 0)
-    episodes = list(range(len(a_max)))
-    with plt.style.context('ggplot'):
-        plt.rcParams.update({'font.size': 20})
-        plt.figure()
-        plt.fill_between(episodes, a_max, a_min, facecolor = 'red', alpha = 0.3)
-        plt.plot(episodes, a_line, 'r-', label = 'Agent')
-        if b_path:
-            leg = plt.legend(loc = 'upper left', shadow = True, fancybox = True)
-        else:
-            leg = plt.legend(loc = 'lower right', shadow = True, fancybox = True)
-        leg.get_frame().set_alpha(0.5)
-        plt.title(policy_name)
-        plt.xlabel('Training Epochs')
-        if b_path:
-            plt.ylabel('Number of Cycles')
-        else:
-            plt.ylabel('Score')
-        plt.tight_layout()
-        path_fig = os.path.join(path_log, 'plot_score.png')
-        plt.savefig(path_fig)
+    return a_rewards
+
+def get_parser():
+    """
+    Creates an argument parser.
+    """
+    parser = argparse.ArgumentParser(description='RL training for MEDA')
+    # device
+    parser.add_argument('--cuda', help='CUDA Visible devices', default='0', type=str, required=False)
+    # rl training
+    parser.add_argument('--method', help='The method use for rl training (centralized, sharing, concurrent)',
+                        type=str, default='concurrent', choices=['centralized', 'sharing', 'concurrent'])
+    parser.add_argument('--n-repeat', help='Number of repeats for the experiment', type=int, default=3)
+    parser.add_argument('--start-iters', help='Number of iterations the initialized model has been trained',
+                        type=int, default=0)
+    parser.add_argument('--stop-iters', help='Total number of iterations (including pre-train) for one repeat of the experiment',
+                        type=int, default=100)
+    parser.add_argument('--n-timesteps', help='Number of timesteps for each iteration',
+                        type=int, default=20000)
+    # env settings
+    parser.add_argument('--width', help='Width of the biochip', type = int, default = 30)
+    parser.add_argument('--length', help='Length of the biochip', type = int, default = 60)
+    parser.add_argument('--n-agents', help='Number of agents', type = int, default = 2)
+    parser.add_argument('--b-degrade', action = "store_true")
+    parser.add_argument('--per-degrade', help='Percentage of degrade', type = float, default = 0.1)
+    # rl evaluate
+    parser.add_argument('--n-evaluate', help='Number of episodes to evaluate the model for each iteration',
+                        type=int, default=20)
+    return parser
+
+def main(args=None):
+    parser = get_parser()
+    args = parser.parse_args(args)
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
+    # the path to where log files will be saved
+    # example path: log/30_60/PPO_SimpleCnnPolicy
+    multi_results, baseline_rewards = {}, {}
+    path_log_dir = os.path.join('log', args.method, str(args.width)+'_'+str(args.length), str(args.n_agents))
+    for algo in ALGOS:
+        path_log = os.path.join(path_log_dir, algo+'_VggCnnPolicy')
+        multi_results[algo] = read_rewards(path_log, 'multi_rewards.csv')
+        baseline_rewards[algo] = read_rewards(path_log, 'baseline_rewards.csv')
+    plotRewards(args, multi_results, baseline_rewards, path_log_dir)
 
 if __name__ == '__main__':
-
-    # parameters to create the environment
-    args = {'w': 30, 'l': 60,
-            'n_droplets': 1,
-            'b_degrade': False,
-            'per_degrade': 0.1}
-
-    algorithm_names = algorithm_names_to_algorithms.keys()
-    policy_names = policy_names_to_policies.keys()
-
-    for algorithm_name in algorithm_names:
-        for policy_name in policy_names:
-
-            # the path to where log files will be saved
-            # example path: log/30_60/PPO_SimpleCnnPolicy
-            path_log = os.path.join('log',
-                    '_'.join( ( str(args['w']), str(args['l']) )),
-                    str(args['n_droplets']),
-                    '_'.join((algorithm_name, policy_name))
-                    )
-
-            agent_reward_filename = 'a_rewards.csv'
-            path_agent_reward = os.path.join(path_log, agent_reward_filename)
-            if not os.path.exists(path_agent_reward):
-                raise Exception('The reward does not exist')
-
-            with open(path_agent_reward, "r") as a:
-                wr_a = csv.reader(a, delimiter=',')
-                a_rewards = list(wr_a)
-            plotAgentPerformance(a_rewards, policy_name, algorithm_name, path_log, b_path = False)
-
+    main()

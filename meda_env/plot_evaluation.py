@@ -29,37 +29,36 @@ def get_ave_max_min (agent_rewards):
     agent_min = np.min(agent_rewards, axis = 0)
     return agent_line, agent_max, agent_min
 
-def plotAgentPerformance(multi_agent_rewards, single_agent_rewards, optimal_rewards, path_log, algorithm_name):
-    multi_agent_line, multi_agent_max, multi_agent_min = get_ave_max_min (multi_agent_rewards)
-    single_agent_line, single_agent_max, single_agent_min = get_ave_max_min (single_agent_rewards)
-    optimal_line, optimal_max, optimal_min = get_ave_max_min (optimal_rewards)
-
-    episodes = list(range(len(multi_agent_line)))
+def plotAgentPerformance(args, multi_agent_rewards, baseline_rewards, path_log):
+    multi_agent_ave, multi_agent_max, multi_agent_min = get_ave_max_min (multi_agent_rewards)
+    baseline_ave, baseline_max, baseline_min = get_ave_max_min (baseline_rewards)
+    episodes = list(range(len(multi_agent_ave)))
+    print(baseline_ave)
+    print(multi_agent_ave)
     with plt.style.context('ggplot'):
         plt.rcParams.update({'font.size': 20})
         plt.figure()
         plt.fill_between(episodes, multi_agent_max, multi_agent_min, facecolor = 'red', alpha = 0.3)
-        plt.fill_between(episodes, single_agent_max, single_agent_min, facecolor = 'yellow', alpha = 0.3)
-        plt.fill_between(episodes, optimal_max, optimal_min, facecolor = 'blue', alpha = 0.3)
-        plt.plot(episodes, multi_agent_line, 'r-', label = 'Multi Agent')
-        plt.plot(episodes, single_agent_line, 'y-', label = 'Single Agent')
-        plt.plot(episodes, optimal_line, 'b-', label = 'Baseline')
+        plt.fill_between(episodes, baseline_max, baseline_min, facecolor = 'blue', alpha = 0.3)
+        plt.plot(episodes, multi_agent_ave, 'r-', label = 'Multi Agent')
+        plt.plot(episodes, baseline_ave, 'b-', label = 'Baseline')
         leg = plt.legend(loc = 'lower right', shadow = True, fancybox = True)
         leg.get_frame().set_alpha(0.5)
-        fig_title = algorithm_name
+        fig_title = args.algo
         plt.title(fig_title)
         plt.xlabel('Training Epochs')
         plt.ylabel('Score')
         plt.tight_layout()
-        path_fig = os.path.join(path_log, 'plot_evluation.png')
+        if args.b_degrade:
+            path_fig = os.path.join(path_log, 'plot_evluation_degrade.png')
+        else:
+            path_fig = os.path.join(path_log, 'plot_evluation.png')
         plt.savefig(path_fig)
 
 def read_rewards(path_log, filename):
     path_reward = os.path.join(path_log, filename)
-
     if not os.path.exists(path_reward):
         raise Exception('Path %s does not exist' %path_reward)
-
     with open(path_reward, "r") as a:
         wr_a = csv.reader(a, delimiter=',')
         a_rewards = list(wr_a)
@@ -87,7 +86,7 @@ def get_parser():
     # env settings
     parser.add_argument('--width', help='Width of the biochip', type = int, default = 30)
     parser.add_argument('--length', help='Length of the biochip', type = int, default = 60)
-    parser.add_argument('--num-agents', help='Number of agents', type = int, default = 2)
+    parser.add_argument('--n-agents', help='Number of agents', type = int, default = 2)
     parser.add_argument('--b-degrade', action = "store_true")
     parser.add_argument('--per-degrade', help='Percentage of degrade', type = float, default = 0.1)
     # rl evaluate
@@ -101,15 +100,16 @@ def main(args=None):
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
     # the path to where log files will be saved
     # example path: log/30_60/PPO_SimpleCnnPolicy
-    path_log = os.path.join('log', str(args.width)+'_'+str(args.length),
-            str(args.num_agents), args.algo+'_VggCnnPolicy')
+    path_log = os.path.join('log', args.method, str(args.width)+'_'+str(args.length),
+            str(args.n_agents), args.algo+'_VggCnnPolicy')
     print('### Start plotting algorithm %s'%(args.algo))
-
-    multi_rewards = read_rewards(path_log, 'multi_rewards.csv')
-    multi_rewards = read_rewards(path_log, 'multi_rewards.csv')
-    baseline_rewards = read_rewards(path_log, 'baseline_rewards.csv')
-
-    plotAgentPerformance(multi_rewards, multi_rewards, baseline_rewards, path_log, args.algo)
+    if args.b_degrade:
+        multi_rewards = read_rewards(path_log, 'multi_degrade_rewards.csv')
+        baseline_rewards = read_rewards(path_log, 'baseline_degrade_rewards.csv')
+    else:
+        multi_rewards = read_rewards(path_log, 'multi_rewards.csv')
+        baseline_rewards = read_rewards(path_log, 'baseline_rewards.csv')
+    plotAgentPerformance(args, multi_rewards, baseline_rewards, path_log)
 
 if __name__ == '__main__':
     main()

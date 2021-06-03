@@ -5,6 +5,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import warnings
 warnings.filterwarnings('ignore')
 from pathlib import Path
+import argparse
 
 import time
 from PIL import ImageDraw
@@ -12,24 +13,27 @@ import matplotlib
 import matplotlib.pyplot as plt
 import tensorflow as tf
 
-
 from my_net import VggCnnPolicy, VggCnnLstmPolicy, VggCnnLnLstmPolicy
 
 from meda import*
 
 from stable_baselines.common import make_vec_env
 from stable_baselines.common.vec_env import DummyVecEnv
-from stable_baselines.common.policies import MlpPolicy, MlpLstmPolicy, MlpLnLstmPolicy
 from stable_baselines.common.evaluation import evaluate_policy
-from stable_baselines import PPO2, A2C
+from stable_baselines import PPO2, ACER, DQN
+from envs.meda import*
+from my_net import VggCnnPolicy, DqnVggCnnPolicy
+from utilities import DecentrailizedTrainer, CentralizedEnv, ParaSharingEnv, ConcurrentAgentEnv
 import csv
 
 
-policy_names_to_policies = {'VggCnnPolicy': VggCnnPolicy,
-        'VggCnnLnLstmPolicy': VggCnnLnLstmPolicy}
+ALGOS = {'PPO': PPO2, 'ACER': ACER, 'DQN': DQN}
 
-algorithm_names_to_algorithms = {'PPO': PPO2}
-
+def showIsGPU():
+    if tf.test.is_gpu_available():
+        print("### Training on GPUs... ###")
+    else:
+        print("### Training on CPUs... ###")
 
 def getGameLength(env):
     ans = env.agt_pos[0] - env.agt_end[0]
@@ -50,36 +54,40 @@ def drawGridInImg(image, step):
         draw.line(line, fill = "rgb(64, 64, 64)")
     return image
 
-def runAGame(model, env):
+def runAGame(agent, env, centralized = True):
+    if centralized:
+        env = CentralizedEnv(env)
     obs = env.reset()
-    #env.envs[0].b_random = True
-    #repeat = random.randrange(0, 100)
-    #for i in range(repeat):
-    #    env.reset()
-    #    obs = env.reset()
-    images = []
     done, state = False, None
+    images = []
     while not done:
-        action, state = model.predict(obs)
-        obs, reward, done, _info = env.step(action)
-        done = done[0]
-        img = env.envs[0].render('rgb_array')
+        if centralized: # centralized multi-agent
+            action, state = agent.predict(obs)
+            obs, reward, done, _info = env.step(action)
+        else: # concurrent, para-sharing
+            action = {}
+            for droplet in env.agents:
+                model = agent[droplet]
+                obs_droplet = obs[droplet]
+                action[droplet], _ = model.predict(obs_droplet)
+            obs, m_rewards, m_dones, _info = env.step(action)
+            reward = np.average([r for r in m_rewards.values()])
+            done = bool(np.all([d for d in m_dones.values()]))
+        img = env.render('rgb_array')
         frame = Image.fromarray(img)
-        scale = int(200 / env.envs[0].width)
-        frame = frame.resize((env.envs[0].length * scale,
-                env.envs[0].width * scale))
+        scale = int(200 / env.width)
+        frame = frame.resize((env.length * scale, env.width * scale))
         frame = drawGridInImg(frame, scale)
         images.append(frame)
-    #env.envs[0].b_random = False
     return images[:-1]
 
-def recordVideo(env, model, filename):
+def recordVideo(args, env, model, filename):
     """ Record videos for three games """
     # env = model.get_env()
     images = []
-    images = images + runAGame(model, env)
-    images = images + runAGame(model, env)
-    images = images + runAGame(model, env)
+    images = images + runAGame(model, env, args.method == 'centralized')
+    images = images + runAGame(model, env, args.method == 'centralized')
+    images = images + runAGame(model, env, args.method == 'centralized')
     images[0].save(filename + '.gif',
             format='GIF',
             append_images=images[1:],
@@ -89,56 +97,76 @@ def recordVideo(env, model, filename):
     print('Video saved:', filename)
 
 
-def trainNRecordASetting(env, path_log, algorithm_name, policy_name,
-        n_iterations, n_timesteps, repeat_num = 1):
-    algorithm = algorithm_names_to_algorithms[algorithm_name]
+def trainNRecordASetting(args, path_log, env, repeat_num=1):
+    algo = ALGOS[args.algo]
+    len_results = (args.stop_iters - args.start_iters)//5 + 1
+
     video_name = os.path.join(path_log, 'images')
     Path(video_name).mkdir(parents=True, exist_ok=True)
     # No modules first
-    for i in range(0, n_iterations + 1):
-        if i % 5 == 0:
-            model_name = '_'.join(('repeat', str(repeat_num),\
-                                'training', str(i), str(n_timesteps)))
-            multi_agent = algorithm.load(os.path.join(path_log,
-                                            model_name))
-            recordVideo(env, multi_agent, os.path.join(video_name, str(i)))
+    for i in range(len_results):
+        print('### Recording iteration %d' %(i*5))
+        model_name = '_'.join(['repeat', str(repeat_num), 'training', str(i*5), str(args.n_timesteps)])
+        path_multi = os.path.join(path_log, model_name)
+        if args.method == 'centralized':
+            multi_agent = algo.load(path_multi)
+        else:
+            multi_agent = {}
+            for agent_index, agent in enumerate(env.agents):
+                if args.method == 'concurrent':
+                    multi_agent[agent] = algo.load(path_multi+'_c{}'.format(agent_index))
+                else:
+                    multi_agent[agent] = algo.load(path_multi+'shared')
 
-def recordTrainingProcess(args, path_log,
-                        algorithm_name, policy_name,
-                        n_iterations = 300, n_timesteps = 20000, repeat_num = 1):
-    env = make_vec_env(
-            MEDAEnv, n_envs = 4, env_kwargs = args)
-    trainNRecordASetting(env, path_log,
-        algorithm_name, policy_name,
-        n_iterations=n_iterations, n_timesteps = 20000,
-        repeat_num = 1)
-    return
+        recordVideo(args, env, multi_agent, os.path.join(video_name, str(i)))
+
+def recordTrainingProcess(args, path_log):
+    showIsGPU()
+    env = MEDAEnv(w=args.width, l=args.length, n_agents=args.n_agents,
+                  b_degrade=args.b_degrade, per_degrade = args.per_degrade)
+    trainNRecordASetting(args, path_log, env)
+
+def get_parser():
+    """
+    Creates an argument parser.
+    """
+    parser = argparse.ArgumentParser(description='RL training for MEDA')
+    # device
+    parser.add_argument('--cuda', help='CUDA Visible devices', default='0', type=str, required=False)
+    parser.add_argument('--algo', help='RL Algorithm', default='PPO', type=str, required=False, choices=list(ALGOS.keys()))
+    # rl training
+    parser.add_argument('--method', help='The method use for rl training (centralized, sharing, concurrent)',
+                        type=str, default='concurrent', choices=['centralized', 'sharing', 'concurrent'])
+    parser.add_argument('--n-repeat', help='Number of repeats for the experiment', type=int, default=3)
+    parser.add_argument('--start-iters', help='Number of iterations the initialized model has been trained',
+                        type=int, default=0)
+    parser.add_argument('--stop-iters', help='Total number of iterations (including pre-train) for one repeat of the experiment',
+                        type=int, default=100)
+    parser.add_argument('--n-timesteps', help='Number of timesteps for each iteration',
+                        type=int, default=20000)
+    # env settings
+    parser.add_argument('--width', help='Width of the biochip', type = int, default = 30)
+    parser.add_argument('--length', help='Length of the biochip', type = int, default = 60)
+    parser.add_argument('--n-agents', help='Number of agents', type = int, default = 2)
+    parser.add_argument('--b-degrade', action = "store_true")
+    parser.add_argument('--per-degrade', help='Percentage of degrade', type = float, default = 0.1)
+    # rl evaluate
+    parser.add_argument('--n-evaluate', help='Number of episodes to evaluate the model for each iteration',
+                        type=int, default=20)
+    return parser
+
+def main(args=None):
+    parser = get_parser()
+    args = parser.parse_args(args)
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
+    # the path to where log files will be saved
+    # example path: log/30_60/PPO_SimpleCnnPolicy
+    path_log = os.path.join('log', args.method, str(args.width)+'_'+str(args.length),
+            str(args.n_agents), args.algo+'_VggCnnPolicy')
+    print('### Start recording algorithm %s'%(args.algo))
+
+    recordTrainingProcess(args, path_log = path_log)
+    print('### Finished studio.py successfully ###')
 
 if __name__ == '__main__':
-
-    # parameters to create the environment
-    args = {'w': 80, 'l': 60,
-            'n_droplets': 2,
-            'b_degrade': False,
-            'per_degrade': 0.1}
-    # parameters to in the training process
-    repeat_n = 1 # Which repeat to use for gif creation
-    num_iteration = 300 # number of iteration runned in one repeat
-
-    algorithm_names = algorithm_names_to_algorithms.keys()
-    policy_names = policy_names_to_policies.keys()
-
-    for algorithm_name in algorithm_names:
-        for policy_name in policy_names:
-            # the path to where log files will be saved
-            # example path: log/30_60/PPO_SimpleCnnPolicy
-            path_log = os.path.join('log',
-                    '_'.join( ( str(args['w']), str(args['l']) )),
-                    str(args['n_droplets']),
-                    '_'.join((algorithm_name, policy_name))
-                    )
-
-            recordTrainingProcess(args, path_log,
-                    algorithm_name, policy_name,
-                    n_iterations = num_iteration, n_timesteps = 20000, repeat_num = repeat_n)
-            print('### Finished studio.py successfully ###')
+    main()

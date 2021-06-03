@@ -17,7 +17,7 @@ from stable_baselines import PPO2, ACER, DQN
 
 from meda import*
 from my_net import VggCnnPolicy, DqnVggCnnPolicy
-from utilities import DecentrailizedTrainer
+from utilities import DecentrailizedTrainer, CentralizedEnv, ParaSharingEnv, ConcurrentAgentEnv
 
 ALGOS = {'PPO': PPO2, 'ACER': ACER, 'DQN': DQN}
 
@@ -26,17 +26,6 @@ def showIsGPU():
         print("### Training on GPUs... ###")
     else:
         print("### Training on CPUs... ###")
-
-def save_model(args, path_log, repeat_num, model):
-    """
-    Save the model
-    Example model name: repeat_1_training_100_20000
-    """
-    model_name = '_'.join(['repeat', str(repeat_num), 'training', str(args.start_iters), str(args.n_timesteps)])
-
-    if args.b_degrade:
-        model_name = 'degrade_' + model_name
-    model.save(os.path.join(path_log, model_name))
 
 def runAnExperiment(args, path_log, env, repeat_num):
 
@@ -48,29 +37,29 @@ def runAnExperiment(args, path_log, env, repeat_num):
     else:
         policy = VggCnnPolicy
 
-
     if args.method == 'centralized':
+        env = CentralizedEnv(env)
         if args.start_iters == 0:
             model = algo(policy, env)
             if path_log:
-                save_model(args, path_log, repeat_num, model)
+                model.save(os.path.join(path_log, model_name))
         else:
+            env = make_vec_env(CentralizedEnv, env_kwargs = {'env': env.env})
             model = algo.load(os.path.join(path_log, model_name), env=env)
     else:
+        model = DecentrailizedTrainer(policy, env, args.algo, args.method == 'concurrent')
         if args.start_iters == 0:
-            model = DecentrailizedTrainer(policy, env, args.algo, args.method == 'concurrent')
             if path_log:
-                save_model(args, path_log, repeat_num, model)
+                model.save(os.path.join(path_log, model_name))
         else:
-            model = {}
-            for i, agent in enumerate(env.agents):
-                model[agent] = algo.load(os.path.join(path_log, model_name)+'_c{}'.format(i), env=env)
+            model.load(os.path.join(path_log, model_name), algo, is_vec=True)
 
     for i in range(args.start_iters+1, args.stop_iters + 1):
         print("### Start training the iteration %d" %(i))
         model.learn(total_timesteps = args.n_timesteps)
-        if path_log and i%5 == 0:
-            save_model(args, path_log, repeat_num, model)
+        if path_log and i%10 == 0:
+            model_name = '_'.join(['repeat', str(repeat_num), 'training', str(i), str(args.n_timesteps)])
+            model.save(os.path.join(path_log, model_name))
 
 def expSeveralRuns(args=None, path_log=None):
 
@@ -79,7 +68,7 @@ def expSeveralRuns(args=None, path_log=None):
     for repeat in range(1, args.n_repeat+1):
         print("### In repeat %d" %(repeat))
         start_time = time.time()
-        env = MEDAEnv(w=args.width, l=args.length, n_droplets=args.n_agents,
+        env = MEDAEnv(w=args.width, l=args.length, n_agents=args.n_agents,
                       b_degrade=args.b_degrade, per_degrade = args.per_degrade)
         runAnExperiment(args, path_log, env, repeat_num=repeat)
         print("### Repeat %s costs %s seconds ###" %(str(repeat), time.time() - start_time))
@@ -95,7 +84,6 @@ def get_parser():
 
     # rl algorithm
     parser.add_argument('--algo', help='RL Algorithm', default='PPO', type=str, required=False, choices=list(ALGOS.keys()))
-
     # rl training
     parser.add_argument('--method', help='The method use for rl training (centralized, sharing, concurrent)',
                         type=str, default='concurrent', choices=['centralized', 'sharing', 'concurrent'])
@@ -112,10 +100,9 @@ def get_parser():
     parser.add_argument('--length', help='Length of the biochip', type = int, default = 60)
     parser.add_argument('--n-agents', help='Number of agents', type = int, default = 2)
     parser.add_argument('--b-degrade', action = "store_true")
-    parser.add_argument('--per-degrade', help='Percentage of degrade', type = float, default = 0.1)
+    parser.add_argument('--per-degrade', help='Percentage of degrade', type = float, default = 0)
 
     return parser
-
 
 def main(args=None):
     parser = get_parser()

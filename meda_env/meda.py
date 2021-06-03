@@ -10,6 +10,13 @@ from datetime import datetime
 import gym
 from gym import error, spaces, utils
 from gym.utils import seeding
+from pettingzoo.utils.env import ParallelEnv
+
+"""
+New MEDA Environment for the MARL work
+Use PettingZoo as the envrionment wrapper
+2020/12/12 by T.-C. Liang
+"""
 
 class Action(IntEnum):
     N = 0 #North
@@ -25,17 +32,20 @@ class Droplet:
     def __init__(self, x_min, x_max, y_min, y_max):
         if x_min > x_max or y_min > y_max:
             raise TypeError('Droplet() inputs are illegal')
+        if x_max - x_min != y_max - y_min:
+            raise RuntimeError('Droplet() is not a square')
         self.x_min = int(x_min)
         self.x_max = int(x_max)
         self.y_min = int(y_min)
         self.y_max = int(y_max)
         self.x_center = int((x_min + x_max) / 2)
         self.y_center = int((y_min + y_max) / 2)
+        self.radius = x_max - self.x_center
 
     def __repr__(self):
         return "Droplet(x = " + str(self.x_center) + ", y = " +\
                 str(self.y_center) + ", r = " +\
-                str(self.x_max - self.x_center) + ")"
+                str(self.radius) + ")"
 
     def __eq__(self, rhs):
         if isinstance(rhs, Droplet):
@@ -62,11 +72,9 @@ class Droplet:
             return False
 
     def isTooClose(self, m):
-        """ Return true if distance is less than 1.2 radius sum """
+        """ Return true if distance is less than 1.5 radius sum """
         distance = self.getDistance(m)
-        r1 = self.x_max - self.x_center
-        r2 = m.x_max - m.x_center
-        return distance < 1.5 * (r1 + r2 + 1)
+        return distance < 1.5 * (self.radius + m.radius + 2)
 
     def _isLinesOverlap(self, xa_1, xa_2, xb_1, xb_2):
         if xa_1 > xb_2:
@@ -137,6 +145,7 @@ class RoutingTaskManager:
         random.seed(datetime.now())
         for i in range(n_droplets):
             self.addTask()
+        self.step_count = [0] * self.n_droplets
 
     def refresh(self):
         self.starts.clear()
@@ -161,6 +170,30 @@ class RoutingTaskManager:
         self.distances.append(
                 self.droplets[-1].getDistance(self.destinations[-1]))
         self.starts.append(copy.deepcopy(self.droplets[-1]))
+
+    def resetTask(self, agent_index):
+        drp_center = self.getRandomYX()
+        dst_center = self.getRandomYX()
+        while dst_center == drp_center or\
+                self._isCenterTooClose(dst_center, self.destinations):
+            dst_center = self.getRandomYX()
+        drp = self._getDropletFromCenter(drp_center)
+        dst = self._getDropletFromCenter(dst_center)
+        self.droplets[agent_index] = drp
+        self.destinations[agent_index] = dst
+        self.distances[agent_index] = drp.getDistance(dst)
+        self.starts[agent_index] = copy.deepcopy(drp)
+
+    def _isCenterTooClose(self, center, l_droplets, r = 3):
+        for d in l_droplets:
+            if abs(center[1] - d.x_center) <= 2*r and\
+                    abs(center[0] - d.y_center) <= 2*r:
+                return True
+        return False
+
+    def _getDropletFromCenter(self, center, r = 3):
+        return Droplet(center[1] - r, center[1] + r, center[0] - r,
+                center[0] + r)
 
     def _genLegalDroplet(self, dtype):
         d_center = self.getRandomYX()
@@ -190,38 +223,52 @@ class RoutingTaskManager:
 
     def moveDroplets(self, actions, m_health):
         if len(actions) != self.n_droplets:
-            raise RuntimeError("The number of actions is not the same as n_droplets")
-        n_active_d = len(self.droplets)
-        droplets = []
-        destinations = []
+            raise RuntimeError("The number of actions is not the same"
+                    " as n_droplets")
         rewards = []
-        #print(self.droplets)
-        for i in range(n_active_d):
-            goal_dist = self.droplets[i].x_max - self.droplets[i].x_center +\
-                    self.destinations[i].x_max - self.destinations[i].x_center
-            if self.distances[i] < goal_dist: # already achieved goal
-                droplets.append(self.destinations[i])
-                destinations.append(self.destinations[i])
-                rewards.append(0.0)
+        for i in range(self.n_droplets):
+            rewards.append(self.moveOneDroplet(i, actions[i], m_health))
+        return rewards
+
+    def moveOneDroplet(self, droplet_index, action, m_health,
+            b_multithread = False):
+        """ Used for multi-threads """
+        if not droplet_index < self.n_droplets:
+            raise RuntimeError("The droplet index {} is out of bound"\
+                    .format(droplet_index))
+        i = droplet_index
+        if b_multithread:
+            while self._waitOtherActions(i):
+                pass
+            self.step_count[i] += 1
+        goal_dist = self.droplets[i].radius + self.destinations[i].radius
+        if self.distances[i] < goal_dist: # already achieved goal
+            self.droplets[i] = copy.deepcopy(self.destinations[i])
+            self.distances[i] = 0
+            reward = 0.0
+        else:
+            prob = self.getMoveProb(self.droplets[i], m_health)
+            if random.random() <= prob:
+                self.droplets[i].move(action, self.width, self.length)
+            new_dist = self.droplets[i].getDistance(self.destinations[i])
+            if new_dist < goal_dist: # get to the destination
+                reward = 1.0
+            elif new_dist < self.distances[i]: # closer to the destination
+                reward = -0.05
             else:
-                prob = self.getMoveProb(self.droplets[i], m_health)
-                if random.random() <= prob:
-                    self.droplets[i].move(actions[i], self.width, self.length)
-                new_dist = self.droplets[i].getDistance(self.destinations[i])
-                if new_dist < goal_dist: # get to the destination
-                    rewards.append(1.0)
-                elif new_dist < self.distances[i]: # closer to the destination
-                    rewards.append(-0.05)
-                else:
-                    rewards.append(-0.1) # penalty for taking one step
-                droplets.append(self.droplets[i])
-                destinations.append(self.destinations[i])
-        self.droplets = droplets
-        self.destinations = destinations
-        self._updateDistances()
-        if rewards.count(1.0) == 0:
-            rewards = self.updateRewardsBasedOnDist(rewards)
-        return np.average(rewards)
+                reward = -0.1 # penalty for taking one more step
+            self.distances[i] = new_dist
+            if self.tooCloseToOthers(i):
+                reward -= 0.8
+        return reward
+
+    def _waitOtherActions(self, index):
+        for i, count in enumerate(self.step_count):
+            if i == index:
+                continue
+            if self.step_count[i] < count:
+                return True
+        return False
 
     def getMoveProb(self, droplet, m_health):
         count = 0
@@ -232,26 +279,21 @@ class RoutingTaskManager:
                 count += 1
         return prob / float(count)
 
-    def updateRewardsBasedOnDist(self, rewards):
-        for i in range(len(self.droplets)):
-            for j in range(i + 1, len(self.droplets)):
-                safe_dst = self.droplets[i].x_max - self.droplets[i].x_center +\
-                        self.droplets[j].x_max - self.droplets[j].x_center
-                real_dst = self.droplets[i].getDistance(self.droplets[j])
-                if real_dst < 1.5 * safe_dst:
-                    rewards[i] -= 0.8
-                    rewards[j] -= 0.8
-                #elif real_dst < 2.0 * safe_dst:
-                #    rewards[i] -= 0.1
-                #    rewards[j] -= 0.1
-        return rewards
+    def tooCloseToOthers(self, index):
+        for i in range(self.n_droplets):
+            if i == index:
+                continue
+            safe_dst = self.droplets[index].radius + self.droplets[i].radius
+            real_dst = self.droplets[index].getDistance(self.droplets[i])
+            if real_dst < 1.5 * safe_dst:
+                return True
+        return False
 
     def getTaskStatus(self):
         goal_distances = []
         for drp, dst in zip(self.droplets, self.destinations):
-            goal_distances.append(drp.x_max - drp.x_center + dst.x_max -\
-                    dst.x_center)
-        return [dist < gd for dist, gd in zip (self.distances, goal_distances)]
+            goal_distances.append(drp.radius + dst.radius)
+        return [dist < gd for dist, gd in zip(self.distances, goal_distances)]
 
 class BaseLineRouter:
     def __init__(self, w, l):
@@ -273,27 +315,28 @@ class BaseLineRouter:
             if l < max_step:
                 trajectories[i] += [Action.N] * (max_step - l)
         rewards = []
-        probs = []
+        steps = np.array([0. for d in routing_manager.droplets])
         for i in range(max_step):
-            if m_health:
-                prob = 0.0
-                for drp in routing_manager.droplets:
-                    prob += routing_manager.getMoveProb(drp, m_health)
-                prob /= len(routing_manager.droplets)
-                probs.append(prob)
             actions_by_droplets = [actions[i] for actions in trajectories]
-            r = routing_manager.moveDroplets(actions_by_droplets,
+            d_rewards = routing_manager.moveDroplets(actions_by_droplets,
                     np.ones((self.width, self.length)))
-            rewards.append(r)
+            np_r = np.average(d_rewards)
+            if m_health is None:
+                rewards.append(np_r)
+            else:
+                move_probs = np.array(
+                        [routing_manager.getMoveProb(drp, m_health)\
+                        for drp in routing_manager.droplets])
+                fail_probs = 1. - move_probs
+                discount_r = np_r * move_probs - 0.9 * fail_probs * move_probs\
+                        - 1.8 * fail_probs * fail_probs * move_probs
+                rewards.append(np.nanmean(discount_r))
+                steps = steps + 1. / move_probs
         routing_manager.restart() # this is important to revert the game
         if m_health is None:
             return sum(rewards), max_step
         else:
-            mod_reward = 0.0
-            for p, r in zip(probs, rewards):
-                mod_reward += r / p
-            max_step = max_step / np.average(probs)
-            return mod_reward, max_step
+            return sum(rewards), max(steps)
 
     def markLocation(self, road_map, drp, value):
         for y in range(drp.y_min, drp.y_max + 1):
@@ -316,10 +359,10 @@ class BaseLineRouter:
             path = x_moves[:i] + y_moves + x_moves[i:]
             valid_path = True
             temp_drp = copy.deepcopy(drp)
-            for i, act in enumerate(path):
+            for j, act in enumerate(path):
                 next_drp = copy.deepcopy(temp_drp)
                 next_drp.move(act, self.width, self.length)
-                if self.checkValidMove(next_drp, temp_drp, road_map, i + 1):
+                if self.checkValidMove(next_drp, temp_drp, road_map, j + 1):
                     temp_drp = next_drp
                 else:
                     valid_path = False
@@ -360,7 +403,7 @@ class BaseLineRouter:
                     return False
         return True
 
-class MEDAEnv(gym.Env):
+class MEDAEnv(ParallelEnv):
     """ A MEDA biochip environment
         [0,0]
           +---l---+-> x
@@ -371,21 +414,27 @@ class MEDAEnv(gym.Env):
           y
     """
     metadata = {'render.modes': ['human', 'rgb_array']}
-    def __init__(self, w, l, n_droplets, b_degrade = False, per_degrade = 0.7):
+    def __init__(self, w, l, n_agents, b_degrade = False,
+            per_degrade = 0.1):
         super(MEDAEnv, self).__init__()
         assert w > 0 and l > 0
-        assert n_droplets > 0
-        # OpenAI Gym setup
+        assert n_agents > 0
+        # PettingZoo Gym setup
         self.actions = Action
-        self.action_space = spaces.Discrete(
-                int(math.pow(len(self.actions), n_droplets)))
-        self.observation_space = spaces.Box(low = 0, high = 1,
-                shape = (w, l, 3 * n_droplets), dtype = 'uint8')
-        self.reward_range = (-1.0, 1.0)
+        self.agents = ["player_{}".format(i) for i in range(n_agents)]
+        self.possible_agents = self.agents[:]
+        self.action_spaces = {name: spaces.Discrete(len(self.actions))
+                for name in self.agents}
+        self.observation_spaces = {name: spaces.Box(
+                low = 0, high = 1, shape = (w, l, 3), dtype = 'uint8')
+                for name in self.agents}
+        #self.reward_range = (-1.0, 1.00)
+        self.rewards = {i: 0. for i in self.agents}
+        self.dones = {i: False for i in self.agents}
         # Other data members
         self.width = w
         self.length = l
-        self.routing_manager = RoutingTaskManager(w, l, n_droplets)
+        self.routing_manager = RoutingTaskManager(w, l, n_agents)
         self.b_degrade = b_degrade
         self.max_step = (w + l)
         self.m_health = np.ones((w, l))
@@ -403,32 +452,40 @@ class MEDAEnv(gym.Env):
 
     def step(self, actions):
         self.step_count += 1
-        l_actions = self.decompressedAction(actions)
-        reward = self.routing_manager.moveDroplets(l_actions, self.m_health)
+        acts = [actions[agent] for agent in self.agents]
+        rewards = self.routing_manager.moveDroplets(acts, self.m_health)
+        for key, r in zip(self.agents, rewards):
+            self.rewards[key] = r
         obs = self.getObs()
         if self.step_count <= self.max_step:
             status = self.routing_manager.getTaskStatus()
-            done = np.all(status)
-            self.addUsage(status)
+            for key, s in zip(self.agents, status):
+                self.dones[key] = s
+            self.addUsage()
         else:
-            done = True
-        return obs, reward, done, {}
-
-    def decompressedAction(self, actions):
-        l_actions = []
-        while actions > 0:
-            l_actions.append(Action(actions % len(self.actions)))
-            actions = int(actions / len(self.actions))
-        while len(l_actions) < self.routing_manager.n_droplets:
-            l_actions.append(Action(0))
-        return l_actions
+            for key in self.agents:
+                self.dones[key] = True
+        return obs, self.rewards, self.dones, {}
 
     def reset(self):
+        self.rewards = {i: 0. for i in self.agents}
+        self.dones = {i: False for i in self.agents}
         self.step_count = 0
         self.routing_manager.refresh()
         obs = self.getObs()
-        self._updateHealth()
+        self.updateHealth()
         return obs
+
+    def restart(self, index = None):
+        """ Used for evaluation """
+        self.routing_manager.restart()
+        self.rewards = {i: 0. for i in self.agents}
+        self.dones = {i: False for i in self.agents}
+        self.step_count = 0
+        if index:
+            return self.getOneObs(index)
+        else:
+            return self.getObs()
 
     def render(self, mode = 'human'):
         """ Show environment """
@@ -449,6 +506,11 @@ class MEDAEnv(gym.Env):
         elif mode == 'rgb_array':
             # Default is grey
             img = np.full((self.width, self.length, 3), 192, dtype = np.uint8)
+            if self.b_degrade:
+                #img[self.m_health < 0.7] = [255, 102, 255] #light purple
+                #img[self.m_health < 0.5] = [255, 153, 255] #purple
+                img[self.m_health < 0.7] = [128, 128, 128] #light grey
+                img[self.m_health < 0.5] = [64, 64, 64] #grey
             for des in self.routing_manager.destinations:
                 for y in range(des.y_min, des.y_max + 1):
                     for x in range(des.x_min, des.x_max + 1):
@@ -457,12 +519,12 @@ class MEDAEnv(gym.Env):
                 for y in range(drp.y_min, drp.y_max + 1):
                     for x in range(drp.x_min, drp.x_max + 1):
                         img[y][x] = [0, 0, 255] # blue for droplets
-            if self.b_degrade:
-                img[self.m_health < 0.5] = [255, 102, 255] #light purple
-                img[self.m_health < 0.7] = [255, 153, 255] #purple
             return img
         else:
             raise RuntimeError('Unknown mode in render')
+
+    def seed(self, seed = None):
+        pass
 
     def close(self):
         """ close render view """
@@ -477,15 +539,16 @@ class MEDAEnv(gym.Env):
                 'Halfly degraded:', n_mid - n_bad,
                 'Mildly degraded', n_ok - n_mid)
 
-    def addUsage(self, status):
-        for i in range(self.routing_manager.n_droplets):
-            if not status[i]:
+    def addUsage(self):
+        #for i in range(self.routing_manager.n_droplets):
+        for i, agent in enumerate(self.agents):
+            if not self.dones[agent]:
                 droplet = self.routing_manager.droplets[i]
                 for y in range(droplet.y_min, droplet.y_max + 1):
                     for x in range(droplet.x_min, droplet.x_max + 1):
                         self.m_usage[y][x] += 1
 
-    def _updateHealth(self):
+    def updateHealth(self):
         if not self.b_degrade:
             return
         index = self.m_usage > 50.0 #degrade here
@@ -493,32 +556,41 @@ class MEDAEnv(gym.Env):
         self.m_usage[index] = 0
 
     def getObs(self):
+        observations = {}
+        for i, agent in enumerate(self.agents):
+            observations[agent] = self.getOneObs(i)
+        return observations
+
+    def getOneObs(self, agent_index):
         """
         RGB format of image
         Obstacles - red in layer 0
         Goal      - greed in layer 1
         Droplet   - blue in layer 2
         """
-        obs = np.zeros(shape = (self.width, self.length,
-                3 * self.routing_manager.n_droplets))
-        for i in range(self.routing_manager.n_droplets):
-            # First add other droplets in 3 x i layer
-            for j in range(self.routing_manager.n_droplets):
-                if j == i:
-                    continue
-                o_drp = self.routing_manager.droplets[j]
-                obs = self._addDropletInObsLayer(obs, o_drp, 3 * i)
-            # Add destination in 3 x i + 1 layer
-            dst = self.routing_manager.destinations[i]
-            obs = self._addDropletInObsLayer(obs, dst, 3 * i + 1)
-            # Add droplet in 3 x i + 2 layer
-            drp = self.routing_manager.droplets[i]
-            obs = self._addDropletInObsLayer(obs, drp, 3 * i + 2)
+        obs = np.zeros(shape = (self.width, self.length, 3))
+        # First add other droplets in 0 layer
+        for j in range(self.routing_manager.n_droplets):
+            if j == agent_index:
+                continue
+            o_drp = self.routing_manager.droplets[j]
+            obs = self._addDropletInObsLayer(obs, o_drp, 0)
+        # Add destination in 1 layer
+        dst = self.routing_manager.destinations[agent_index]
+        obs = self._addDropletInObsLayer(obs, dst, 1)
+        # Add droplet in 2 layer
+        drp = self.routing_manager.droplets[agent_index]
+        obs = self._addDropletInObsLayer(obs, drp, 2)
         return obs
 
     def _addDropletInObsLayer(self, obs, droplet, layer):
-        for y in range(droplet.y_min, droplet.y_max + 1):
-            for x in range(droplet.x_min, droplet.x_max + 1):
+        y_min = 0 if droplet.y_min < 0 else droplet.y_min
+        y_max = self.width - 1 if droplet.y_max >= self.width else droplet.y_max
+        for y in range(y_min, y_max + 1):
+            x_min = 0 if droplet.x_min < 0 else droplet.x_min
+            x_max = self.length - 1 if droplet.x_max >= self.length else\
+                    droplet.x_max
+            for x in range(x_min, x_max + 1):
                 obs[y][x][layer] = 1
         return obs
 
