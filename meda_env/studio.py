@@ -21,7 +21,6 @@ from stable_baselines.common import make_vec_env
 from stable_baselines.common.vec_env import DummyVecEnv
 from stable_baselines.common.evaluation import evaluate_policy
 from stable_baselines import PPO2, ACER, DQN
-from envs.meda import*
 from my_net import VggCnnPolicy, DqnVggCnnPolicy
 from utilities import DecentrailizedTrainer, CentralizedEnv, ParaSharingEnv, ConcurrentAgentEnv
 import csv
